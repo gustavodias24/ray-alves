@@ -1,513 +1,512 @@
-<!doctype html>
-<html lang="pt-BR">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="csrf-token" content="{{ csrf_token }}">
-  <title>Gestão de Manutenção</title>
-  <link rel="preconnect" href="https://cdn.jsdelivr.net">
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
-  <link href="{{ url_for('static', filename='css/style.css') }}" rel="stylesheet">
-  <style>
-    /* Mantém o formulário do modal dentro da altura disponível e libera a rolagem. */
-    #machineModal .modal-content > #machineForm {
-      display: flex;
-      flex: 1 1 auto;
-      flex-direction: column;
-      min-height: 0;
-      max-height: 100%;
+import hmac
+import os
+import re
+import secrets
+from datetime import datetime, timezone
+from functools import wraps
+from urllib.parse import urlparse
+
+import requests
+from bson import ObjectId
+from bson.errors import InvalidId
+from dotenv import load_dotenv
+from flask import (
+    Flask,
+    Response,
+    flash,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
+from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
+from pymongo.errors import PyMongoError
+
+
+load_dotenv()
+
+app = Flask(__name__)
+app.config.update(
+    SECRET_KEY=os.getenv("SECRET_KEY", "chave-local-altere-na-producao"),
+    MAX_CONTENT_LENGTH=10 * 1024 * 1024,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=bool(os.getenv("VERCEL")),
+)
+
+STATUS_LABELS = {
+    "operando": "Operando",
+    "operando_requer_manutencao": "Operando — requer manutenção",
+    "manutencao": "Em manutenção",
+}
+
+_mongo_client = None
+_indexes_ready = False
+
+
+def utc_now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def get_collection():
+    global _mongo_client, _indexes_ready
+    uri = os.getenv("MONGODB_URI", "").strip()
+    if not uri:
+        raise RuntimeError("A variável MONGODB_URI não foi configurada.")
+
+    if _mongo_client is None:
+        _mongo_client = MongoClient(
+            uri,
+            serverSelectionTimeoutMS=6000,
+            connectTimeoutMS=6000,
+            retryWrites=True,
+        )
+
+    database_name = os.getenv("MONGODB_DB", "gestao_manutencao").strip()
+    collection = _mongo_client[database_name]["maquinas"]
+
+    if not _indexes_ready:
+        collection.create_index([("nome", ASCENDING)])
+        collection.create_index([("status", ASCENDING), ("updated_at", DESCENDING)])
+        _indexes_ready = True
+
+    return collection
+
+
+def login_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not session.get("authenticated"):
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "Sessão expirada. Entre novamente."}), 401
+            return redirect(url_for("index"))
+        return view(*args, **kwargs)
+
+    return wrapped
+
+
+@app.before_request
+def prepare_session_and_validate_csrf():
+    if "csrf_token" not in session:
+        session["csrf_token"] = secrets.token_urlsafe(32)
+
+    if request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
+        return None
+
+    supplied = request.headers.get("X-CSRF-Token") or request.form.get("csrf_token", "")
+    expected = session.get("csrf_token", "")
+    if supplied and expected and hmac.compare_digest(supplied, expected):
+        return None
+
+    if request.path.startswith("/api/"):
+        return jsonify({"error": "Não foi possível validar a solicitação."}), 403
+
+    flash("Não foi possível validar a solicitação. Atualize a página e tente novamente.", "danger")
+    return redirect(url_for("index"))
+
+
+def clean_text(value, limit=2000):
+    if value is None:
+        return ""
+    return str(value).strip()[:limit]
+
+
+def parse_nonnegative_number(value, field_name):
+    if value in (None, ""):
+        return None
+    try:
+        number = float(str(value).replace(",", "."))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} deve ser um número válido.") from exc
+    if number < 0:
+        raise ValueError(f"{field_name} não pode ser negativo.")
+    return number
+
+
+def valid_imgur_url(value):
+    if not value:
+        return ""
+    parsed = urlparse(value)
+    if parsed.scheme != "https" or parsed.hostname not in {"i.imgur.com", "imgur.com"}:
+        raise ValueError("A foto informada não possui um endereço válido do Imgur.")
+    return value[:1000]
+
+
+def history_entry(entry_type, description):
+    return {
+        "id": secrets.token_hex(8),
+        "data": utc_now_iso(),
+        "tipo": clean_text(entry_type, 80),
+        "descricao": clean_text(description, 1000),
     }
 
-    #machineModal .modal-header,
-    #machineModal .modal-footer {
-      flex: 0 0 auto;
+
+def format_hours_pt(value):
+    formatted = f"{value:.3f}".rstrip("0").rstrip(".")
+    return formatted.replace(".", ",")
+
+
+def normalized_payload(payload, existing=None):
+    nome = clean_text(payload.get("nome"), 120)
+    if not nome:
+        raise ValueError("Informe o nome da máquina.")
+
+    status = clean_text(payload.get("status"), 60)
+    if status not in STATUS_LABELS:
+        raise ValueError("Selecione um status válido.")
+
+    maintenance = payload.get("manutencao") or {}
+    if not isinstance(maintenance, dict):
+        raise ValueError("Os dados de manutenção são inválidos.")
+
+    old_photo_url = (existing or {}).get("foto_url", "")
+    old_delete_hash = (existing or {}).get("foto_delete_hash", "")
+    remove_image = bool(payload.get("remover_foto"))
+
+    if remove_image:
+        photo_url = ""
+        delete_hash = ""
+    elif "foto_url" in payload:
+        photo_url = valid_imgur_url(clean_text(payload.get("foto_url"), 1000))
+        delete_hash = clean_text(payload.get("foto_delete_hash"), 200)
+        if photo_url == old_photo_url and not delete_hash:
+            delete_hash = old_delete_hash
+    else:
+        photo_url = old_photo_url
+        delete_hash = old_delete_hash
+
+    return {
+        "nome": nome,
+        "operador": clean_text(payload.get("operador"), 120),
+        "horimetro": parse_nonnegative_number(payload.get("horimetro"), "Horímetro"),
+        "status": status,
+        "foto_url": photo_url,
+        "foto_delete_hash": delete_hash,
+        "manutencao": {
+            "data_inicio_campo": clean_text(maintenance.get("data_inicio_campo"), 40),
+            "horas_parada_campo": parse_nonnegative_number(
+                maintenance.get("horas_parada_campo"), "Tempo parado no campo"
+            ),
+            "cidade": clean_text(maintenance.get("cidade"), 120),
+            "data_inicio_cidade": clean_text(maintenance.get("data_inicio_cidade"), 40),
+            "reparo_campo": clean_text(maintenance.get("reparo_campo"), 3000),
+            "detalhes": clean_text(maintenance.get("detalhes"), 5000),
+            "pedido_pecas": clean_text(maintenance.get("pedido_pecas"), 3000),
+        },
     }
 
-    #machineModal .modal-body {
-      flex: 1 1 auto;
-      min-height: 0;
-      overflow-x: hidden;
-      overflow-y: auto !important;
-      overscroll-behavior: contain;
-      -webkit-overflow-scrolling: touch;
-      touch-action: pan-y;
+
+def serialize_machine(machine):
+    return {
+        "id": str(machine["_id"]),
+        "nome": machine.get("nome", ""),
+        "operador": machine.get("operador", ""),
+        "horimetro": machine.get("horimetro"),
+        "status": machine.get("status", "operando"),
+        "status_label": STATUS_LABELS.get(machine.get("status"), "Não informado"),
+        "foto_url": machine.get("foto_url", ""),
+        "manutencao": machine.get("manutencao", {}),
+        "historico": machine.get("historico", []),
+        "created_at": machine.get("created_at", ""),
+        "updated_at": machine.get("updated_at", ""),
     }
 
-    @media (max-width: 575.98px) {
-      #machineModal .modal-dialog {
-        width: 100%;
-        max-width: none;
-        height: 100dvh;
-        min-height: 100dvh;
-        margin: 0;
-      }
 
-      #machineModal .modal-content {
-        width: 100%;
-        height: 100dvh;
-        max-height: 100dvh;
-        border: 0;
-        border-radius: 0;
-      }
+def parse_object_id(machine_id):
+    try:
+        return ObjectId(machine_id)
+    except (InvalidId, TypeError) as exc:
+        raise ValueError("Identificador de máquina inválido.") from exc
 
-      #machineModal .modal-header {
-        padding-top: max(1rem, env(safe-area-inset-top));
-      }
 
-      #machineModal .modal-body {
-        padding-bottom: 1.5rem !important;
-      }
+def delete_imgur_image(delete_hash):
+    client_id = os.getenv("IMGUR_CLIENT_ID", "").strip()
+    if not client_id or not delete_hash:
+        return
+    try:
+        requests.delete(
+            f"https://api.imgur.com/3/image/{delete_hash}",
+            headers={"Authorization": f"Client-ID {client_id}"},
+            timeout=12,
+        )
+    except requests.RequestException:
+        pass
 
-      #machineModal .modal-footer {
-        position: relative;
-        z-index: 5;
-        padding-bottom: max(0.75rem, env(safe-area-inset-bottom));
-        background: #fff;
-        box-shadow: 0 -8px 20px rgba(15, 23, 42, 0.08);
-      }
 
-      #machineModal .modal-footer .btn {
-        flex: 1 1 0;
-      }
+@app.route("/")
+def index():
+    return render_template(
+        "index.html",
+        authenticated=bool(session.get("authenticated")),
+        username=session.get("username", ""),
+        csrf_token=session["csrf_token"],
+    )
 
-      #machineModal .photo-upload,
-      #machineModal .photo-placeholder {
-        min-height: 11rem;
-      }
 
-      #machineModal .photo-upload img {
-        height: 11rem;
-      }
+@app.post("/login")
+def login():
+    configured_user = os.getenv("APP_USERNAME", "admin").strip()
+    configured_password = os.getenv("APP_PASSWORD", "")
+    username = request.form.get("username", "").strip()
+    password = request.form.get("password", "")
+
+    if not configured_password:
+        flash("Defina APP_PASSWORD nas variáveis de ambiente antes de entrar.", "danger")
+        return redirect(url_for("index"))
+
+    user_ok = hmac.compare_digest(username, configured_user)
+    password_ok = hmac.compare_digest(password, configured_password)
+    if not (user_ok and password_ok):
+        flash("Usuário ou senha incorretos.", "danger")
+        return redirect(url_for("index"))
+
+    session.clear()
+    session["authenticated"] = True
+    session["username"] = configured_user
+    session["csrf_token"] = secrets.token_urlsafe(32)
+    return redirect(url_for("index"))
+
+
+@app.post("/logout")
+@login_required
+def logout():
+    session.clear()
+    return redirect(url_for("index"))
+
+
+@app.get("/api/maquinas")
+@login_required
+def list_machines():
+    query = {}
+    status = request.args.get("status", "").strip()
+    search = request.args.get("q", "").strip()
+    if status in STATUS_LABELS:
+        query["status"] = status
+    if search:
+        safe_search = re.escape(search[:120])
+        query["$or"] = [
+            {"nome": {"$regex": safe_search, "$options": "i"}},
+            {"operador": {"$regex": safe_search, "$options": "i"}},
+        ]
+
+    machines = get_collection().find(query).sort("updated_at", DESCENDING)
+    return jsonify([serialize_machine(machine) for machine in machines])
+
+
+@app.post("/api/maquinas")
+@login_required
+def create_machine():
+    payload = request.get_json(silent=True) or {}
+    machine = normalized_payload(payload)
+    now = utc_now_iso()
+    machine.update(
+        {
+            "historico": [
+                history_entry(
+                    "cadastro",
+                    f"Máquina cadastrada com o status: {STATUS_LABELS[machine['status']] }.",
+                )
+            ],
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+    result = get_collection().insert_one(machine)
+    machine["_id"] = result.inserted_id
+    return jsonify(serialize_machine(machine)), 201
+
+
+@app.put("/api/maquinas/<machine_id>")
+@login_required
+def update_machine(machine_id):
+    object_id = parse_object_id(machine_id)
+    collection = get_collection()
+    existing = collection.find_one({"_id": object_id})
+    if not existing:
+        return jsonify({"error": "Máquina não encontrada."}), 404
+
+    payload = request.get_json(silent=True) or {}
+    updated = normalized_payload(payload, existing)
+    updated["updated_at"] = utc_now_iso()
+
+    history = list(existing.get("historico", []))
+    if existing.get("status") != updated["status"]:
+        history.insert(
+            0,
+            history_entry(
+                "alteração de status",
+                f"Status alterado para: {STATUS_LABELS[updated['status']] }.",
+            ),
+        )
+
+    history_note = clean_text(payload.get("historico_descricao"), 1000)
+    if history_note:
+        history.insert(0, history_entry("atualização de manutenção", history_note))
+    updated["historico"] = history[:500]
+
+    collection.update_one({"_id": object_id}, {"$set": updated})
+
+    old_photo = existing.get("foto_url", "")
+    if old_photo and old_photo != updated.get("foto_url"):
+        delete_imgur_image(existing.get("foto_delete_hash", ""))
+
+    saved = collection.find_one({"_id": object_id})
+    return jsonify(serialize_machine(saved))
+
+
+@app.delete("/api/maquinas/<machine_id>")
+@login_required
+def delete_machine(machine_id):
+    object_id = parse_object_id(machine_id)
+    collection = get_collection()
+    machine = collection.find_one({"_id": object_id})
+    if not machine:
+        return jsonify({"error": "Máquina não encontrada."}), 404
+
+    collection.delete_one({"_id": object_id})
+    delete_imgur_image(machine.get("foto_delete_hash", ""))
+    return jsonify({"message": "Máquina excluída."})
+
+
+@app.post("/api/maquinas/<machine_id>/historico")
+@login_required
+def add_history(machine_id):
+    object_id = parse_object_id(machine_id)
+    payload = request.get_json(silent=True) or {}
+    entry_type = clean_text(payload.get("tipo"), 80) or "observação"
+    description = clean_text(payload.get("descricao"), 1000)
+    if not description:
+        raise ValueError("Informe a descrição do lançamento.")
+
+    entry = history_entry(entry_type, description)
+    result = get_collection().update_one(
+        {"_id": object_id},
+        {
+            "$push": {"historico": {"$each": [entry], "$position": 0, "$slice": 500}},
+            "$set": {"updated_at": utc_now_iso()},
+        },
+    )
+    if not result.matched_count:
+        return jsonify({"error": "Máquina não encontrada."}), 404
+    return jsonify(entry), 201
+
+
+@app.post("/api/maquinas/<machine_id>/horimetro")
+@login_required
+def add_hourmeter_hours(machine_id):
+    object_id = parse_object_id(machine_id)
+    payload = request.get_json(silent=True) or {}
+    hours = parse_nonnegative_number(payload.get("horas"), "Horas lançadas")
+    if hours is None or hours <= 0:
+        raise ValueError("Informe uma quantidade de horas maior que zero.")
+    if hours > 100000:
+        raise ValueError("A quantidade de horas informada é muito alta.")
+
+    hours = round(hours, 3)
+    collection = get_collection()
+
+    # Cadastros antigos podem não possuir horímetro. Nesse caso, a soma começa em zero.
+    collection.update_one(
+        {"_id": object_id, "horimetro": None},
+        {"$set": {"horimetro": 0}},
+    )
+
+    entry = history_entry(
+        "lançamento de horas",
+        f"{format_hours_pt(hours)} h adicionadas ao horímetro.",
+    )
+    entry["horas_lancadas"] = hours
+
+    machine = collection.find_one_and_update(
+        {"_id": object_id},
+        {
+            "$inc": {"horimetro": hours},
+            "$push": {"historico": {"$each": [entry], "$position": 0, "$slice": 500}},
+            "$set": {"updated_at": utc_now_iso()},
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    if not machine:
+        return jsonify({"error": "Máquina não encontrada."}), 404
+
+    return jsonify({"maquina": serialize_machine(machine), "lancamento": entry})
+
+
+@app.post("/api/upload-image")
+@login_required
+def upload_image():
+    client_id = os.getenv("IMGUR_CLIENT_ID", "").strip()
+    if not client_id:
+        return jsonify({"error": "IMGUR_CLIENT_ID não foi configurado."}), 503
+
+    image = request.files.get("image")
+    if not image or not image.filename:
+        return jsonify({"error": "Selecione uma imagem."}), 400
+    if not (image.mimetype or "").startswith("image/"):
+        return jsonify({"error": "O arquivo selecionado não é uma imagem válida."}), 400
+
+    try:
+        response = requests.post(
+            "https://api.imgur.com/3/image",
+            headers={"Authorization": f"Client-ID {client_id}"},
+            files={"image": (image.filename, image.stream, image.mimetype)},
+            data={"type": "file", "title": clean_text(request.form.get("title"), 120)},
+            timeout=30,
+        )
+        result = response.json()
+    except (requests.RequestException, ValueError):
+        return jsonify({"error": "Não foi possível enviar a imagem ao Imgur."}), 502
+
+    if not response.ok or not result.get("success") or not result.get("data", {}).get("link"):
+        message = result.get("data", {}).get("error", "Falha no envio da imagem.")
+        if isinstance(message, dict):
+            message = message.get("message", "Falha no envio da imagem.")
+        return jsonify({"error": clean_text(message, 300)}), 502
+
+    data = result["data"]
+    return jsonify({"url": data["link"], "delete_hash": data.get("deletehash", "")})
+
+
+@app.get("/api/exportar")
+@login_required
+def export_data():
+    machines = [serialize_machine(item) for item in get_collection().find().sort("nome", ASCENDING)]
+    body = {
+        "exportado_em": utc_now_iso(),
+        "maquinas": machines,
     }
-  </style>
-</head>
-<body>
-{% if not authenticated %}
-  <main class="login-page">
-    <section class="login-panel shadow-lg">
-      <div class="brand-mark mb-4"><i class="bi bi-gear-wide-connected"></i></div>
-      <p class="eyebrow mb-2">CONTROLE OPERACIONAL</p>
-      <h1 class="h3 fw-bold mb-2">Gestão de Manutenção</h1>
-      <p class="text-secondary mb-4">Acesse o painel para acompanhar máquinas, manutenções e históricos.</p>
+    import json
 
-      {% with messages = get_flashed_messages(with_categories=true) %}
-        {% for category, message in messages %}
-          <div class="alert alert-{{ category }} py-2" role="alert">{{ message }}</div>
-        {% endfor %}
-      {% endwith %}
+    content = json.dumps(body, ensure_ascii=False, indent=2)
+    return Response(
+        content,
+        mimetype="application/json",
+        headers={"Content-Disposition": "attachment; filename=maquinas-backup.json"},
+    )
 
-      <form action="{{ url_for('login') }}" method="post">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <div class="mb-3">
-          <label for="username" class="form-label">Usuário</label>
-          <div class="input-group input-group-lg">
-            <span class="input-group-text"><i class="bi bi-person"></i></span>
-            <input id="username" name="username" class="form-control" autocomplete="username" required autofocus>
-          </div>
-        </div>
-        <div class="mb-4">
-          <label for="password" class="form-label">Senha</label>
-          <div class="input-group input-group-lg">
-            <span class="input-group-text"><i class="bi bi-lock"></i></span>
-            <input id="password" name="password" type="password" class="form-control" autocomplete="current-password" required>
-          </div>
-        </div>
-        <button class="btn btn-primary btn-lg w-100" type="submit">
-          Entrar <i class="bi bi-arrow-right ms-1"></i>
-        </button>
-      </form>
-    </section>
-  </main>
-{% else %}
-  <nav class="navbar navbar-expand-lg navbar-dark app-navbar sticky-top">
-    <div class="container-xl">
-      <a class="navbar-brand d-flex align-items-center gap-2" href="#">
-        <span class="brand-mark brand-mark-sm"><i class="bi bi-gear-wide-connected"></i></span>
-        <span>Gestão de Manutenção</span>
-      </a>
-      <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#mainNav" aria-controls="mainNav" aria-expanded="false" aria-label="Abrir navegação">
-        <span class="navbar-toggler-icon"></span>
-      </button>
-      <div class="collapse navbar-collapse" id="mainNav">
-        <div class="navbar-nav ms-auto align-items-lg-center gap-lg-2 pt-3 pt-lg-0">
-          <span class="navbar-text small me-lg-2"><i class="bi bi-person-circle me-1"></i>{{ username }}</span>
-          <a class="btn btn-outline-light btn-sm" href="/api/exportar">
-            <i class="bi bi-download me-1"></i>Exportar dados
-          </a>
-          <button class="btn btn-outline-light btn-sm" type="button" onclick="window.print()">
-            <i class="bi bi-printer me-1"></i>Imprimir
-          </button>
-          <form action="{{ url_for('logout') }}" method="post" class="m-0">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            <button class="btn btn-light btn-sm w-100" type="submit"><i class="bi bi-box-arrow-right me-1"></i>Sair</button>
-          </form>
-        </div>
-      </div>
-    </div>
-  </nav>
 
-  <main class="container-xl py-4 py-lg-5">
-    <header class="page-heading d-flex flex-column flex-md-row justify-content-between align-items-md-end gap-3 mb-4">
-      <div>
-        <p class="eyebrow mb-2">VISÃO GERAL</p>
-        <h1 class="display-6 fw-bold mb-1">Painel de máquinas</h1>
-        <p class="text-secondary mb-0">Acompanhe a operação e mantenha o histórico de manutenção centralizado.</p>
-      </div>
-      <button class="btn btn-primary btn-lg" id="btnNewMachine" type="button">
-        <i class="bi bi-plus-lg me-1"></i>Nova máquina
-      </button>
-    </header>
+@app.errorhandler(ValueError)
+def handle_validation_error(error):
+    if request.path.startswith("/api/"):
+        return jsonify({"error": str(error)}), 400
+    return str(error), 400
 
-    <section class="row g-3 mb-4" aria-label="Indicadores">
-      <div class="col-6 col-lg-3">
-        <article class="metric-card h-100">
-          <span class="metric-icon metric-total"><i class="bi bi-grid"></i></span>
-          <div><span class="metric-label">Total</span><strong id="statTotal">0</strong></div>
-        </article>
-      </div>
-      <div class="col-6 col-lg-3">
-        <article class="metric-card h-100">
-          <span class="metric-icon metric-operating"><i class="bi bi-check2-circle"></i></span>
-          <div><span class="metric-label">Operando</span><strong id="statOperating">0</strong></div>
-        </article>
-      </div>
-      <div class="col-6 col-lg-3">
-        <article class="metric-card h-100">
-          <span class="metric-icon metric-attention"><i class="bi bi-exclamation-triangle"></i></span>
-          <div><span class="metric-label">Requer manutenção</span><strong id="statAttention">0</strong></div>
-        </article>
-      </div>
-      <div class="col-6 col-lg-3">
-        <article class="metric-card h-100">
-          <span class="metric-icon metric-maintenance"><i class="bi bi-tools"></i></span>
-          <div><span class="metric-label">Em manutenção</span><strong id="statMaintenance">0</strong></div>
-        </article>
-      </div>
-    </section>
 
-    <section class="content-card mb-4">
-      <div class="row g-3 align-items-end">
-        <div class="col-12 col-md-7 col-lg-8">
-          <label class="form-label" for="searchMachine">Buscar</label>
-          <div class="input-group">
-            <span class="input-group-text bg-white"><i class="bi bi-search"></i></span>
-            <input id="searchMachine" class="form-control" placeholder="Nome da máquina ou operador">
-          </div>
-        </div>
-        <div class="col-12 col-md-5 col-lg-4">
-          <label class="form-label" for="statusFilter">Status</label>
-          <select id="statusFilter" class="form-select">
-            <option value="">Todos os status</option>
-            <option value="operando">Operando</option>
-            <option value="operando_requer_manutencao">Operando — requer manutenção</option>
-            <option value="manutencao">Em manutenção</option>
-          </select>
-        </div>
-      </div>
-    </section>
+@app.errorhandler(PyMongoError)
+def handle_mongo_error(_error):
+    if request.path.startswith("/api/"):
+        return jsonify({"error": "Não foi possível acessar o banco de dados."}), 503
+    return "Não foi possível acessar o banco de dados.", 503
 
-    <div id="globalAlert" aria-live="polite"></div>
 
-    <section class="mb-5">
-      <div class="section-title d-flex justify-content-between align-items-center mb-3">
-        <h2 class="h5 fw-bold mb-0">Máquinas cadastradas</h2>
-        <span class="text-secondary small" id="resultCount">0 registros</span>
-      </div>
-      <div class="row g-4" id="machineList"></div>
-      <div class="empty-state d-none" id="emptyState">
-        <i class="bi bi-inboxes"></i>
-        <h3 class="h5">Nenhuma máquina encontrada</h3>
-        <p class="text-secondary mb-3">Cadastre uma máquina ou ajuste os filtros da busca.</p>
-        <button class="btn btn-primary" type="button" data-action="new-machine">Cadastrar máquina</button>
-      </div>
-    </section>
+@app.errorhandler(413)
+def file_too_large(_error):
+    if request.path.startswith("/api/"):
+        return jsonify({"error": "A imagem deve ter no máximo 10 MB."}), 413
+    return "Arquivo muito grande.", 413
 
-    <section class="content-card" id="reportSection">
-      <div class="d-flex flex-column flex-sm-row justify-content-between gap-2 mb-3">
-        <div>
-          <p class="eyebrow mb-1">ATIVIDADE RECENTE</p>
-          <h2 class="h5 fw-bold mb-0">Histórico geral</h2>
-        </div>
-        <span class="text-secondary small align-self-sm-end" id="historyCount">0 lançamentos</span>
-      </div>
-      <div id="generalHistory" class="timeline"></div>
-    </section>
-  </main>
 
-  <div class="modal fade" id="machineModal" tabindex="-1" aria-labelledby="machineModalTitle" aria-hidden="true">
-    <div class="modal-dialog modal-xl modal-dialog-scrollable modal-fullscreen-sm-down">
-      <div class="modal-content">
-        <form id="machineForm">
-          <div class="modal-header">
-            <div>
-              <p class="eyebrow mb-1">CADASTRO OPERACIONAL</p>
-              <h2 class="modal-title h4 fw-bold" id="machineModalTitle">Nova máquina</h2>
-            </div>
-            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Fechar"></button>
-          </div>
-          <div class="modal-body p-3 p-md-4">
-            <input type="hidden" id="machineId">
-            <input type="hidden" id="photoUrl">
-            <input type="hidden" id="photoDeleteHash">
-            <input type="hidden" id="removePhoto" value="0">
-
-            <div class="row g-4">
-              <div class="col-12 col-lg-4">
-                <label class="form-label">Foto da máquina</label>
-                <label class="photo-upload" id="photoUpload" for="photoFile">
-                  <div class="photo-placeholder" id="photoPlaceholder">
-                    <i class="bi bi-camera"></i>
-                    <strong>Selecionar foto</strong>
-                    <span>JPG, PNG ou WebP de até 10 MB</span>
-                  </div>
-                  <img id="photoPreview" alt="Prévia da máquina" class="d-none">
-                  <input id="photoFile" type="file" accept="image/jpeg,image/png,image/webp,image/gif" hidden>
-                </label>
-                <div class="progress mt-2 d-none" id="uploadProgress" role="progressbar" aria-label="Envio da foto">
-                  <div class="progress-bar progress-bar-striped progress-bar-animated w-100">Enviando foto</div>
-                </div>
-                <button class="btn btn-outline-danger btn-sm mt-2 d-none" id="btnRemovePhoto" type="button">
-                  <i class="bi bi-trash3 me-1"></i>Remover foto
-                </button>
-              </div>
-
-              <div class="col-12 col-lg-8">
-                <div class="row g-3">
-                  <div class="col-12 col-md-6">
-                    <label for="machineName" class="form-label">Nome da máquina *</label>
-                    <input id="machineName" class="form-control" maxlength="120" required placeholder="Ex.: Colheitadeira 01">
-                  </div>
-                  <div class="col-12 col-md-6">
-                    <label for="operatorName" class="form-label">Operador</label>
-                    <input id="operatorName" class="form-control" maxlength="120" placeholder="Nome do responsável">
-                  </div>
-                  <div class="col-12 col-md-6">
-                    <label for="hourmeter" class="form-label">Horímetro</label>
-                    <div class="input-group">
-                      <input id="hourmeter" class="form-control" type="number" min="0" step="0.1" inputmode="decimal" placeholder="0,0">
-                      <span class="input-group-text">h</span>
-                    </div>
-                  </div>
-                  <div class="col-12 col-md-6">
-                    <label for="machineStatus" class="form-label">Status *</label>
-                    <select id="machineStatus" class="form-select" required>
-                      <option value="operando">Operando</option>
-                      <option value="operando_requer_manutencao">Operando — requer manutenção</option>
-                      <option value="manutencao">Em manutenção</option>
-                    </select>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <section class="maintenance-form mt-4 d-none" id="maintenanceFields">
-              <div class="d-flex align-items-center gap-2 mb-3">
-                <span class="section-icon"><i class="bi bi-tools"></i></span>
-                <div>
-                  <h3 class="h6 fw-bold mb-0">Informações da manutenção</h3>
-                  <span class="small text-secondary">Preencha os dados disponíveis para acompanhamento.</span>
-                </div>
-              </div>
-              <div class="row g-3">
-                <div class="col-12 col-md-6">
-                  <label for="fieldStart" class="form-label">Início no campo</label>
-                  <input id="fieldStart" class="form-control" type="datetime-local">
-                </div>
-                <div class="col-12 col-md-6">
-                  <label for="fieldStoppedHours" class="form-label">Tempo parado no campo</label>
-                  <div class="input-group">
-                    <input id="fieldStoppedHours" class="form-control" type="number" min="0" step="0.1" inputmode="decimal">
-                    <span class="input-group-text">horas</span>
-                  </div>
-                </div>
-                <div class="col-12 col-md-6">
-                  <label for="city" class="form-label">Cidade</label>
-                  <input id="city" class="form-control" maxlength="120">
-                </div>
-                <div class="col-12 col-md-6">
-                  <label for="cityStart" class="form-label">Início na cidade</label>
-                  <input id="cityStart" class="form-control" type="datetime-local">
-                </div>
-                <div class="col-12 col-md-6">
-                  <label for="fieldRepair" class="form-label">Reparo realizado no campo</label>
-                  <textarea id="fieldRepair" class="form-control" rows="3"></textarea>
-                </div>
-                <div class="col-12 col-md-6">
-                  <label for="partsRequest" class="form-label">Pedido de peças</label>
-                  <textarea id="partsRequest" class="form-control" rows="3"></textarea>
-                </div>
-                <div class="col-12">
-                  <label for="maintenanceDetails" class="form-label">Detalhes da manutenção</label>
-                  <textarea id="maintenanceDetails" class="form-control" rows="4"></textarea>
-                </div>
-                <div class="col-12">
-                  <label for="historyNote" class="form-label">Registrar observação no histórico</label>
-                  <textarea id="historyNote" class="form-control" rows="2" placeholder="Opcional. Use este campo para registrar o andamento do serviço."></textarea>
-                </div>
-              </div>
-            </section>
-          </div>
-          <div class="modal-footer">
-            <button type="button" class="btn btn-light" data-bs-dismiss="modal">Cancelar</button>
-            <button type="submit" class="btn btn-primary" id="btnSaveMachine">
-              <span class="spinner-border spinner-border-sm me-2 d-none" aria-hidden="true"></span>
-              <span class="button-label">Salvar máquina</span>
-            </button>
-          </div>
-        </form>
-      </div>
-    </div>
-  </div>
-
-  <div class="modal fade" id="historyModal" tabindex="-1" aria-labelledby="historyModalTitle" aria-hidden="true">
-    <div class="modal-dialog modal-lg modal-dialog-scrollable">
-      <div class="modal-content">
-        <div class="modal-header">
-          <div>
-            <p class="eyebrow mb-1">REGISTROS DA MÁQUINA</p>
-            <h2 class="modal-title h5 fw-bold" id="historyModalTitle">Histórico</h2>
-          </div>
-          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Fechar"></button>
-        </div>
-        <div class="modal-body">
-          <form id="historyForm" class="history-entry-form mb-4">
-            <input type="hidden" id="historyMachineId">
-            <div class="row g-3">
-              <div class="col-12 col-md-4">
-                <label for="historyType" class="form-label">Tipo</label>
-                <select id="historyType" class="form-select">
-                  <option value="observação">Observação</option>
-                  <option value="inspeção">Inspeção</option>
-                  <option value="reparo no campo">Reparo no campo</option>
-                  <option value="pedido de peças">Pedido de peças</option>
-                  <option value="manutenção">Manutenção</option>
-                </select>
-              </div>
-              <div class="col-12 col-md-8">
-                <label for="historyDescription" class="form-label">Descrição *</label>
-                <textarea id="historyDescription" class="form-control" rows="2" required></textarea>
-              </div>
-              <div class="col-12 text-end">
-                <button class="btn btn-primary" type="submit">Adicionar lançamento</button>
-              </div>
-            </div>
-          </form>
-          <div class="timeline" id="machineHistory"></div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div class="modal fade" id="deleteModal" tabindex="-1" aria-labelledby="deleteModalTitle" aria-hidden="true">
-    <div class="modal-dialog modal-dialog-centered">
-      <div class="modal-content">
-        <div class="modal-body p-4 text-center">
-          <span class="delete-icon"><i class="bi bi-trash3"></i></span>
-          <h2 class="h5 fw-bold mt-3" id="deleteModalTitle">Excluir máquina?</h2>
-          <p class="text-secondary">O cadastro e todo o histórico desta máquina serão removidos.</p>
-          <div class="d-flex justify-content-center gap-2">
-            <button class="btn btn-light" type="button" data-bs-dismiss="modal">Cancelar</button>
-            <button class="btn btn-danger" type="button" id="btnConfirmDelete">Excluir</button>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div class="toast-container position-fixed bottom-0 end-0 p-3" id="toastContainer"></div>
-
-  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
-  <script>
-    /* Upload direto no Imgur, seguindo o mesmo fluxo do código de referência. */
-    (() => {
-      const IMGUR_CLIENT_ID = "1299aeeb6489b87";
-
-      async function uploadToImgur(file) {
-        const form = new FormData();
-        form.append("image", file);
-        form.append("type", "file");
-
-        const resp = await fetch("https://api.imgur.com/3/image", {
-          method: "POST",
-          headers: { Authorization: `Client-ID ${IMGUR_CLIENT_ID}` },
-          body: form
-        });
-
-        const res = await resp.json();
-        if (resp.ok && res.success && res.data && res.data.link) {
-          return {
-            url: res.data.link,
-            deleteHash: res.data.deletehash || ""
-          };
-        }
-
-        const detail = typeof res?.data?.error === "string"
-          ? res.data.error
-          : res?.data?.error?.message;
-        throw new Error(detail || "Erro ao enviar imagem para o Imgur.");
-      }
-
-      async function enviarFotoDaMaquina(file) {
-        if (!file) return;
-
-        if (!file.type || !file.type.startsWith("image/")) {
-          alert("Selecione um arquivo de imagem válido.");
-          return;
-        }
-
-        if (file.size > 10 * 1024 * 1024) {
-          alert("A imagem deve ter no máximo 10 MB.");
-          return;
-        }
-
-        const progress = document.getElementById("uploadProgress");
-        const saveButton = document.getElementById("btnSaveMachine");
-        const fileInput = document.getElementById("photoFile");
-        progress.classList.remove("d-none");
-        saveButton.disabled = true;
-
-        try {
-          const imagem = await uploadToImgur(file);
-
-          document.getElementById("photoUrl").value = imagem.url;
-          document.getElementById("photoDeleteHash").value = imagem.deleteHash;
-          document.getElementById("removePhoto").value = "0";
-
-          const preview = document.getElementById("photoPreview");
-          preview.src = imagem.url;
-          preview.classList.remove("d-none");
-          document.getElementById("photoPlaceholder").classList.add("d-none");
-          document.getElementById("btnRemovePhoto").classList.remove("d-none");
-        } catch (error) {
-          console.error("Falha no upload para o Imgur:", error);
-          alert(error.message || "Erro ao enviar imagem para o Imgur.");
-        } finally {
-          progress.classList.add("d-none");
-          saveButton.disabled = false;
-          fileInput.value = "";
-        }
-      }
-
-      const photoFile = document.getElementById("photoFile");
-      const photoUpload = document.getElementById("photoUpload");
-
-      photoFile.addEventListener("change", async (event) => {
-        event.stopImmediatePropagation();
-        await enviarFotoDaMaquina(event.target.files[0]);
-      }, { capture: true });
-
-      photoUpload.addEventListener("drop", async (event) => {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        photoUpload.classList.remove("dragging");
-        await enviarFotoDaMaquina(event.dataTransfer.files[0]);
-      }, { capture: true });
-
-      window.uploadToImgur = uploadToImgur;
-    })();
-  </script>
-  <script src="{{ url_for('static', filename='js/app.js') }}"></script>
-{% endif %}
-</body>
-</html>
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=os.getenv("FLASK_DEBUG") == "1")
