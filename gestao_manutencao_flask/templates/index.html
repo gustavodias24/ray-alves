@@ -360,6 +360,56 @@
     </div>
   </div>
 
+  <div class="modal fade" id="hoursModal" tabindex="-1" aria-labelledby="hoursModalTitle" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+      <div class="modal-content">
+        <form id="hoursForm">
+          <div class="modal-header">
+            <div>
+              <p class="eyebrow mb-1">ATUALIZAÇÃO DO HORÍMETRO</p>
+              <h2 class="modal-title h5 fw-bold" id="hoursModalTitle">Lançar horas</h2>
+            </div>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Fechar"></button>
+          </div>
+          <div class="modal-body p-4">
+            <input type="hidden" id="hoursMachineId">
+            <div class="rounded-3 bg-light border p-3 mb-3">
+              <span class="d-block text-secondary small">Máquina</span>
+              <strong class="d-block" id="hoursMachineName">—</strong>
+              <span class="d-block text-secondary small mt-2">Horímetro atual</span>
+              <strong class="fs-4 text-primary" id="currentHourmeter">0 h</strong>
+            </div>
+            <label for="hoursToAdd" class="form-label">Horas que serão adicionadas *</label>
+            <div class="input-group input-group-lg">
+              <input
+                id="hoursToAdd"
+                class="form-control"
+                type="number"
+                min="0.001"
+                max="100000"
+                step="0.001"
+                inputmode="decimal"
+                placeholder="Ex.: 8,5"
+                required
+              >
+              <span class="input-group-text">horas</span>
+            </div>
+            <p class="small text-secondary mt-2 mb-0">
+              O valor será somado ao horímetro e registrado no histórico com a data e a hora do lançamento.
+            </p>
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-light" data-bs-dismiss="modal">Cancelar</button>
+            <button type="submit" class="btn btn-success" id="btnSaveHours">
+              <span class="spinner-border spinner-border-sm me-2 d-none" aria-hidden="true"></span>
+              <span class="hours-button-label">Confirmar lançamento</span>
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
   <div class="modal fade" id="historyModal" tabindex="-1" aria-labelledby="historyModalTitle" aria-hidden="true">
     <div class="modal-dialog modal-lg modal-dialog-scrollable">
       <div class="modal-content">
@@ -418,6 +468,95 @@
   <div class="toast-container position-fixed bottom-0 end-0 p-3" id="toastContainer"></div>
 
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+  <script>
+    /* Upload direto no Imgur, seguindo o mesmo fluxo do código de referência. */
+    (() => {
+      const IMGUR_CLIENT_ID = "1299aeeb6489b87";
+
+      async function uploadToImgur(file) {
+        const form = new FormData();
+        form.append("image", file);
+        form.append("type", "file");
+
+        const resp = await fetch("https://api.imgur.com/3/image", {
+          method: "POST",
+          headers: { Authorization: `Client-ID ${IMGUR_CLIENT_ID}` },
+          body: form
+        });
+
+        const res = await resp.json();
+        if (resp.ok && res.success && res.data && res.data.link) {
+          return {
+            url: res.data.link,
+            deleteHash: res.data.deletehash || ""
+          };
+        }
+
+        const detail = typeof res?.data?.error === "string"
+          ? res.data.error
+          : res?.data?.error?.message;
+        throw new Error(detail || "Erro ao enviar imagem para o Imgur.");
+      }
+
+      async function enviarFotoDaMaquina(file) {
+        if (!file) return;
+
+        if (!file.type || !file.type.startsWith("image/")) {
+          alert("Selecione um arquivo de imagem válido.");
+          return;
+        }
+
+        if (file.size > 10 * 1024 * 1024) {
+          alert("A imagem deve ter no máximo 10 MB.");
+          return;
+        }
+
+        const progress = document.getElementById("uploadProgress");
+        const saveButton = document.getElementById("btnSaveMachine");
+        const fileInput = document.getElementById("photoFile");
+        progress.classList.remove("d-none");
+        saveButton.disabled = true;
+
+        try {
+          const imagem = await uploadToImgur(file);
+
+          document.getElementById("photoUrl").value = imagem.url;
+          document.getElementById("photoDeleteHash").value = imagem.deleteHash;
+          document.getElementById("removePhoto").value = "0";
+
+          const preview = document.getElementById("photoPreview");
+          preview.src = imagem.url;
+          preview.classList.remove("d-none");
+          document.getElementById("photoPlaceholder").classList.add("d-none");
+          document.getElementById("btnRemovePhoto").classList.remove("d-none");
+        } catch (error) {
+          console.error("Falha no upload para o Imgur:", error);
+          alert(error.message || "Erro ao enviar imagem para o Imgur.");
+        } finally {
+          progress.classList.add("d-none");
+          saveButton.disabled = false;
+          fileInput.value = "";
+        }
+      }
+
+      const photoFile = document.getElementById("photoFile");
+      const photoUpload = document.getElementById("photoUpload");
+
+      photoFile.addEventListener("change", async (event) => {
+        event.stopImmediatePropagation();
+        await enviarFotoDaMaquina(event.target.files[0]);
+      }, { capture: true });
+
+      photoUpload.addEventListener("drop", async (event) => {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        photoUpload.classList.remove("dragging");
+        await enviarFotoDaMaquina(event.dataTransfer.files[0]);
+      }, { capture: true });
+
+      window.uploadToImgur = uploadToImgur;
+    })();
+  </script>
   <script src="{{ url_for('static', filename='js/app.js') }}"></script>
 {% endif %}
 </body>
