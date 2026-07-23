@@ -3,6 +3,7 @@
 
   const csrfToken = document.querySelector('meta[name="csrf-token"]').content;
   const machineModal = new bootstrap.Modal(document.getElementById("machineModal"));
+  const hoursModal = new bootstrap.Modal(document.getElementById("hoursModal"));
   const historyModal = new bootstrap.Modal(document.getElementById("historyModal"));
   const deleteModal = new bootstrap.Modal(document.getElementById("deleteModal"));
 
@@ -192,7 +193,10 @@
             </div>
             ${maintenanceSummary(machine)}
             <div class="d-flex flex-wrap gap-2 mt-3">
-              <button class="btn btn-primary btn-sm flex-grow-1" type="button" data-action="edit" data-id="${machine.id}">
+              <button class="btn btn-success btn-sm flex-grow-1 text-nowrap" type="button" data-action="hours" data-id="${machine.id}">
+                <i class="bi bi-stopwatch me-1"></i>Lançar horas
+              </button>
+              <button class="btn btn-outline-primary btn-sm" type="button" data-action="edit" data-id="${machine.id}">
                 <i class="bi bi-pencil-square me-1"></i>Editar
               </button>
               <button class="btn btn-outline-secondary btn-sm" type="button" data-action="history" data-id="${machine.id}" title="${plural(historyLength, "lançamento", "lançamentos")}">
@@ -421,6 +425,55 @@
     }
   }
 
+  function openHoursModal(id) {
+    const machine = machines.find((item) => item.id === id);
+    if (!machine) return;
+
+    document.getElementById("hoursMachineId").value = machine.id;
+    document.getElementById("hoursMachineName").textContent = machine.nome;
+    document.getElementById("currentHourmeter").textContent = formatNumber(machine.horimetro ?? 0);
+    const input = document.getElementById("hoursToAdd");
+    input.value = "";
+    input.setCustomValidity("");
+    hoursModal.show();
+  }
+
+  async function saveHours(event) {
+    event.preventDefault();
+    const id = document.getElementById("hoursMachineId").value;
+    const input = document.getElementById("hoursToAdd");
+    const hours = Number(input.value);
+    if (!Number.isFinite(hours) || hours <= 0) {
+      input.setCustomValidity("Informe uma quantidade de horas maior que zero.");
+      input.reportValidity();
+      return;
+    }
+    input.setCustomValidity("");
+
+    const button = document.getElementById("btnSaveHours");
+    const spinner = button.querySelector(".spinner-border");
+    const label = button.querySelector(".hours-button-label");
+    button.disabled = true;
+    spinner.classList.remove("d-none");
+    label.textContent = "Lançando";
+
+    try {
+      const result = await apiFetch(`/api/maquinas/${id}/horimetro`, {
+        method: "POST",
+        body: JSON.stringify({ horas: hours }),
+      });
+      hoursModal.hide();
+      showToast(`${formatNumber(hours)} adicionadas. Novo horímetro: ${formatNumber(result.maquina.horimetro)}.`);
+      await loadMachines();
+    } catch (error) {
+      showToast(error.message, "danger");
+    } finally {
+      button.disabled = false;
+      spinner.classList.add("d-none");
+      label.textContent = "Confirmar lançamento";
+    }
+  }
+
   function requestDelete(id) {
     machinePendingDelete = machines.find((item) => item.id === id) || null;
     if (!machinePendingDelete) return;
@@ -450,6 +503,7 @@
     if (event.target.closest('[data-action="new-machine"]')) openNewMachine();
   });
   elements.form.addEventListener("submit", saveMachine);
+  document.getElementById("hoursForm").addEventListener("submit", saveHours);
   document.getElementById("historyForm").addEventListener("submit", saveHistory);
   document.getElementById("btnConfirmDelete").addEventListener("click", confirmDelete);
   elements.status.addEventListener("change", toggleMaintenanceFields);
@@ -482,9 +536,14 @@
     const button = event.target.closest("[data-action][data-id]");
     if (!button) return;
     const { action, id } = button.dataset;
+    if (action === "hours") openHoursModal(id);
     if (action === "edit") openEditMachine(id);
     if (action === "history") openMachineHistory(id);
     if (action === "delete") requestDelete(id);
+  });
+
+  document.getElementById("hoursModal").addEventListener("shown.bs.modal", () => {
+    document.getElementById("hoursToAdd").focus();
   });
 
   loadMachines();
